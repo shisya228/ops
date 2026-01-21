@@ -1,0 +1,8 @@
+[project]
+name = "ops"
+version = "0.1.0"
+description = "Local ops tool"
+requires-python = ">=3.11"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
