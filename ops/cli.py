@@ -57,6 +57,30 @@ def _dedupe_key(adapter: str, locator: str, idx: int, content: str) -> str:
     return sha256_hex(material.encode("utf-8"))
 
 
+def _dedupe_key_from_event(event: dict[str, Any]) -> str | None:
+    dedupe_key = event.get("dedupe_key")
+    if dedupe_key:
+        return dedupe_key
+    if event.get("type") != "chat.message":
+        return None
+    source = event.get("source", {})
+    adapter_name = source.get("kind")
+    locator = source.get("locator")
+    if not adapter_name or not locator:
+        return None
+    idx = None
+    refs = event.get("refs", [])
+    if refs:
+        idx = refs[0].get("span", {}).get("idx")
+    if idx is None:
+        return None
+    payload = event.get("payload", {})
+    content = payload.get("content") or event.get("text")
+    if not content:
+        return None
+    return _dedupe_key(adapter_name, locator, idx, content)
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     root = Path.cwd()
     ops_yml = root / "ops.yml"
@@ -157,7 +181,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     except DatabaseError:
         raise
     created_at = iso_now(config.timezone)
-    for idx, message in enumerate(adapters.iter_chat_messages(source_path)):
+    for idx, message in enumerate(adapters.iter_chat_messages(locator_path)):
         content = message.get("content")
         if content is None:
             result.failed += 1
@@ -173,7 +197,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             continue
         ts_value = message.get("ts")
         if not ts_value:
-            ts_value = iso_from_timestamp(source_path.stat().st_mtime, config.timezone)
+            ts_value = iso_from_timestamp(locator_path.stat().st_mtime, config.timezone)
         text = content.replace("\r\n", "\n").replace("\r", "\n")
         payload = {
             "speaker": message.get("speaker"),
@@ -206,6 +230,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
             **event_core,
             "id": generate_ulid(),
             "hash": event_hash,
+            "dedupe_key": dedupe_key,
         }
         append_event(paths["events"], event)
         try:
@@ -241,35 +266,37 @@ def cmd_query(args: argparse.Namespace) -> int:
     config = load_config(Path("ops.yml"))
     paths = _workspace_paths(config)
     conn = connect(paths["db"])
-    conditions = ["events_fts MATCH ?"]
-    params: list[Any] = [args.query]
-    if args.type:
-        conditions.append("e.type = ?")
-        params.append(args.type)
-    if args.after:
-        conditions.append("e.ts >= ?")
-        params.append(args.after)
-    if args.before:
-        conditions.append("e.ts <= ?")
-        params.append(args.before)
-    if args.tag:
-        conditions.append("e.tags_json LIKE ?")
-        params.append(f'%"{args.tag}"%')
-    where_clause = " AND ".join(conditions)
     limit = args.limit or 20
     snippet_len = config.max_snippet_len
-    query = (
-        "SELECT e.id, e.ts, e.type, e.tags_json, "
-        "substr(e.text, 1, ?) AS snippet "
-        "FROM events_fts JOIN events e ON events_fts.rowid = e.rowid "
-        f"WHERE {where_clause} "
-        "LIMIT ?"
-    )
-    params_with_limit = [snippet_len] + params + [limit]
-    try:
-        rows = conn.execute(query, params_with_limit).fetchall()
-    except sqlite3.Error as exc:
-        raise DatabaseError(f"SQLite query error: {exc}") from exc
+    rows = []
+    if config.fts_enabled:
+        conditions = ["events_fts MATCH ?"]
+        params: list[Any] = [args.query]
+        if args.type:
+            conditions.append("e.type = ?")
+            params.append(args.type)
+        if args.after:
+            conditions.append("e.ts >= ?")
+            params.append(args.after)
+        if args.before:
+            conditions.append("e.ts <= ?")
+            params.append(args.before)
+        if args.tag:
+            conditions.append("e.tags_json LIKE ?")
+            params.append(f'%"{args.tag}"%')
+        where_clause = " AND ".join(conditions)
+        query = (
+            "SELECT e.id, e.ts, e.type, e.tags_json, "
+            "substr(e.text, 1, ?) AS snippet "
+            "FROM events_fts JOIN events e ON events_fts.rowid = e.rowid "
+            f"WHERE {where_clause} "
+            "LIMIT ?"
+        )
+        params_with_limit = [snippet_len] + params + [limit]
+        try:
+            rows = conn.execute(query, params_with_limit).fetchall()
+        except sqlite3.Error:
+            rows = []
     if not rows:
         fallback_conditions = ["e.text LIKE ?"]
         fallback_params: list[Any] = [f"%{args.query}%"]
@@ -355,6 +382,7 @@ def cmd_show(args: argparse.Namespace) -> int:
         "text": row["text"],
         "payload": json.loads(row["payload_json"]),
         "hash": {"algo": row["hash_algo"], "value": row["hash_value"]},
+        "dedupe_key": row["dedupe_key"],
     }
     conn.close()
     if args.open:
@@ -387,6 +415,7 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
     inserted = 0
     skipped = 0
     parse_errors = 0
+    created_at = iso_now(config.timezone)
     with events_path.open("r", encoding="utf-8") as handle:
         for line in handle:
             line = line.strip()
@@ -407,8 +436,8 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
                     _insert_event(
                         conn,
                         event,
-                        event.get("dedupe_key"),
-                        event.get("ts"),
+                        _dedupe_key_from_event(event),
+                        created_at,
                     )
                 inserted += 1
             except DatabaseError:
