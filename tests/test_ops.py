@@ -10,6 +10,7 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ULID_RE = re.compile(r"^[0-9A-HJKMNP-TV-Z]{26}$")
+DEDUPE_RE = re.compile(r"^[0-9a-f]{64}$")
 
 
 def run_ops(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -87,6 +88,7 @@ def test_init_ingest_query_show_rebuild(tmp_path: Path) -> None:
         assert ULID_RE.match(event["id"])
         assert event["hash"]["algo"] == "sha256"
         assert len(event["hash"]["value"]) == 64
+        assert DEDUPE_RE.match(event["dedupe_key"])
 
     ingest_result2 = run_ops(
         tmp_path,
@@ -135,6 +137,7 @@ def test_init_ingest_query_show_rebuild(tmp_path: Path) -> None:
         "text",
         "payload",
         "hash",
+        "dedupe_key",
     ]:
         assert key in show_payload
     assert show_payload["payload"]["content"] == "我想做 memobird CLI 打印"
@@ -145,9 +148,77 @@ def test_init_ingest_query_show_rebuild(tmp_path: Path) -> None:
     assert "Inserted: 3" in rebuild_result.stdout
     assert "Parse errors: 0" in rebuild_result.stdout
 
+    conn = sqlite3.connect(db_path)
+    events_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    dedupe_count = conn.execute("SELECT COUNT(*) FROM dedupe").fetchone()[0]
+    assert events_count == 3
+    assert dedupe_count == 3
+    conn.close()
+
+    ingest_after_rebuild = run_ops(
+        tmp_path,
+        "ingest",
+        "chat_json",
+        str(chat_small),
+        "--tag",
+        "t2",
+        "--tag",
+        "memobird",
+        "--json",
+    )
+    payload_after_rebuild = json.loads(ingest_after_rebuild.stdout)
+    assert payload_after_rebuild["new"] == 0
+    assert payload_after_rebuild["skipped"] == 3
+    assert payload_after_rebuild["failed"] == 0
+
+    events_after_rebuild = read_jsonl(canonical_path)
+    assert len(events_after_rebuild) == 3
+
     query_result2 = run_ops(tmp_path, "query", "memobird", "--json")
     results2 = json.loads(query_result2.stdout)
     assert results2
+
+
+def test_rebuild_backfills_dedupe_from_canonical(tmp_path: Path) -> None:
+    workspace = tmp_path / "compat"
+    workspace.mkdir()
+    chat_small = workspace / "chat_small.json"
+    write_file(
+        chat_small,
+        """[
+{"ts":"2026-02-01T10:00:00+09:00","speaker":"user","content":"我们来做对账机器人","thread_id":"t3"},
+{"ts":"2026-02-01T10:00:05+09:00","speaker":"assistant","content":"先整理接口，再做解析","thread_id":"t3"},
+{"ts":"2026-02-01T10:00:10+09:00","speaker":"user","content":"还需要日报导出","thread_id":"t3"}
+]
+""",
+    )
+    init_result = run_ops(workspace, "init")
+    assert init_result.returncode == 0, init_result.stderr
+    ingest_result = run_ops(workspace, "ingest", "chat_json", str(chat_small), "--json")
+    assert ingest_result.returncode == 0
+
+    canonical_path = workspace / "data" / "canonical" / "events.jsonl"
+    events = read_jsonl(canonical_path)
+    for event in events:
+        event.pop("dedupe_key", None)
+    legacy_path = tmp_path / "events_no_dedupe.jsonl"
+    legacy_path.write_text(
+        "\n".join(json.dumps(event, ensure_ascii=False) for event in events) + "\n",
+        encoding="utf-8",
+    )
+
+    rebuild_result = run_ops(
+        workspace, "index", "rebuild", "--wipe", "--from", str(legacy_path)
+    )
+    assert rebuild_result.returncode == 0, rebuild_result.stderr
+
+    db_path = workspace / "data" / "index" / "brain.sqlite"
+    conn = sqlite3.connect(db_path)
+    events_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    dedupe_count = conn.execute("SELECT COUNT(*) FROM dedupe").fetchone()[0]
+    assert events_count == 3
+    assert dedupe_count == 3
+    conn.close()
 
 
 def test_ingest_jsonl_and_query(tmp_path: Path) -> None:
