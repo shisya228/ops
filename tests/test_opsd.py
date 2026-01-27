@@ -10,6 +10,8 @@ from typing import Any
 from urllib.error import URLError
 from urllib.request import Request, urlopen
 
+import sqlite3
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEDUPE_RE = re.compile(r"^[0-9a-f]{64}$")
 
@@ -89,7 +91,10 @@ def start_opsd(tmp_path: Path) -> tuple[subprocess.Popen, int]:
         stderr=subprocess.PIPE,
         text=True,
     )
-    wait_for_health("127.0.0.1", port)
+    payload = wait_for_health("127.0.0.1", port)
+    assert payload["ok"] is True
+    assert payload["version"] == "0.2"
+    assert payload["schema_version"] == "0.2"
     return proc, port
 
 
@@ -150,7 +155,11 @@ def test_sources_crud_and_ingest_run(tmp_path: Path) -> None:
             assert DEDUPE_RE.match(event["dedupe_key"])
 
         canonical_path = tmp_path / "data" / "canonical" / "events.jsonl"
-        assert len(read_jsonl(canonical_path)) == 3
+        canonical_events = read_jsonl(canonical_path)
+        assert len(canonical_events) == 3
+        for event in canonical_events:
+            assert event.get("dedupe_key")
+            assert DEDUPE_RE.match(event["dedupe_key"])
     finally:
         proc.terminate()
         proc.wait(timeout=5)
@@ -328,6 +337,114 @@ def test_artifacts_pack(tmp_path: Path) -> None:
             if ref.get("uri") in {f"file:{pack_path}", f"file:{readme_path}"}
         ]
         assert refs
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_cli_offline_ingest(tmp_path: Path) -> None:
+    chat_small = tmp_path / "chat_small.json"
+    write_chat_small(chat_small)
+    init_result = run_ops(tmp_path, "init")
+    assert init_result.returncode == 0, init_result.stderr
+
+    ingest_result = run_ops(
+        tmp_path,
+        "ingest",
+        "chat_json",
+        str(chat_small),
+        "--tag",
+        "memobird",
+        "--offline",
+        "--json",
+    )
+    assert ingest_result.returncode == 0, ingest_result.stderr
+    payload = json.loads(ingest_result.stdout)
+    assert payload["new"] == 3
+
+    canonical_path = tmp_path / "data" / "canonical" / "events.jsonl"
+    assert len(read_jsonl(canonical_path)) == 3
+
+    db_path = tmp_path / "data" / "index" / "brain.sqlite"
+    conn = sqlite3.connect(db_path)
+    events_count = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    conn.close()
+    assert events_count == 3
+
+    ingest_result2 = run_ops(
+        tmp_path,
+        "ingest",
+        "chat_json",
+        str(chat_small),
+        "--tag",
+        "memobird",
+        "--offline",
+        "--json",
+    )
+    payload2 = json.loads(ingest_result2.stdout)
+    assert payload2["new"] == 0
+    assert len(read_jsonl(canonical_path)) == 3
+
+
+def test_index_rebuild_job_recovers_index(tmp_path: Path) -> None:
+    chat_small = tmp_path / "chat_small.json"
+    write_chat_small(chat_small)
+    proc, port = start_opsd(tmp_path)
+    endpoint = f"http://127.0.0.1:{port}"
+    try:
+        run_ops(
+            tmp_path,
+            "source",
+            "add",
+            "chat_export",
+            "--path",
+            str(chat_small),
+            "--endpoint",
+            endpoint,
+            "--json",
+        )
+        run_ops(tmp_path, "ingest", "run", "chat_export", "--endpoint", endpoint, "--json")
+
+        db_path = tmp_path / "data" / "index" / "brain.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.execute("DELETE FROM refs")
+        conn.execute("DELETE FROM dedupe")
+        conn.execute("DELETE FROM events")
+        conn.execute("DELETE FROM events_fts")
+        conn.commit()
+        conn.close()
+
+        empty_events = http_get("127.0.0.1", port, "/v1/events?format=summary")
+        assert empty_events["items"] == []
+
+        job_config = {"wipe": True, "fts": True}
+        run_ops(
+            tmp_path,
+            "job",
+            "add",
+            "index_rebuild",
+            "--kind",
+            "index_rebuild",
+            "--config",
+            json.dumps(job_config, ensure_ascii=False),
+            "--endpoint",
+            endpoint,
+            "--json",
+        )
+        run_ops(tmp_path, "job", "run", "index_rebuild", "--endpoint", endpoint, "--json")
+
+        events_response = http_get("127.0.0.1", port, "/v1/events?format=full")
+        assert len(events_response["items"]) == 4
+        for event in events_response["items"]:
+            if event["type"] == "chat.message":
+                assert event.get("dedupe_key")
+                assert DEDUPE_RE.match(event["dedupe_key"])
+
+        search_response = http_get("127.0.0.1", port, "/v1/events?q=memobird")
+        assert search_response["items"]
+
+        canonical_path = tmp_path / "data" / "canonical" / "events.jsonl"
+        assert len(read_jsonl(canonical_path)) == 4
     finally:
         proc.terminate()
         proc.wait(timeout=5)

@@ -13,9 +13,9 @@ from . import adapters
 from .canonical import append_event
 from .client import OpsdClient, OpsdClientError
 from .config import OpsConfig, load_config, write_default_config
-from .db import SCHEMA_VERSION, connect, init_db
+from .db import connect, init_db
 from .errors import AdapterError, DatabaseError, OpsError
-from .events import dedupe_key_from_draft, dedupe_key_from_event, event_hash
+from .events import dedupe_key_from_draft, event_hash
 from .lock import FileLock
 from .utils import generate_ulid, iso_from_timestamp, iso_now, sha256_hex
 
@@ -179,6 +179,16 @@ def cmd_ingest_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_ingest_chat_json(args: argparse.Namespace) -> int:
+    if _check_online(args.endpoint) and not args.offline:
+        raise OpsError("Use ops ingest run for HTTP ingest (or pass --offline)")
+    if not args.offline:
+        raise OpsError("opsd is not reachable (use --offline to ingest locally)")
+    response = _local_ingest_chat_json(args)
+    _print_output(response, args.json)
+    return 0
+
+
 def cmd_view_add(args: argparse.Namespace) -> int:
     if not _check_online(args.endpoint):
         raise OpsError("opsd is not reachable")
@@ -234,7 +244,7 @@ def cmd_job_add(args: argparse.Namespace) -> int:
     payload = {
         "name": args.name,
         "kind": args.kind,
-        "config": json.loads(args.config) if args.config else {},
+        "config": _parse_config_args(args.config),
         "enabled": not args.disabled,
     }
     response = _client(args.endpoint).create_job(payload)
@@ -577,6 +587,53 @@ def _local_ingest_run(args: argparse.Namespace) -> dict[str, Any]:
     return {"new": result.new, "skipped": result.skipped, "failed": result.failed, "errors": result.errors or []}
 
 
+def _local_ingest_chat_json(args: argparse.Namespace) -> dict[str, Any]:
+    config = load_config(Path("ops.yml"))
+    paths = _workspace_paths(config)
+    drafts = _build_chat_drafts(Path(args.path), args.tags or [], config, args.copy)
+    result = IngestResult(errors=[])
+    _local_ingest_with_lock(paths, drafts, result, config.timezone, False)
+    return {"new": result.new, "skipped": result.skipped, "failed": result.failed, "errors": result.errors or []}
+
+
+def _build_chat_drafts(
+    source_path: Path,
+    tags: list[str],
+    config: OpsConfig,
+    copy: bool,
+) -> list[dict[str, Any]]:
+    source_path = source_path if source_path.is_absolute() else (Path.cwd() / source_path)
+    locator_path = source_path
+    locator_value = str(locator_path)
+    if copy:
+        locator_path = _copy_source(source_path, config.workspace / "raw" / "chat_json")
+        locator_value = str(locator_path)
+    drafts = []
+    for idx, message in enumerate(adapters.iter_chat_messages(locator_path)):
+        content = message.get("content")
+        if content is None:
+            raise OpsError(f"Missing content at idx {idx}")
+        ts_value = message.get("ts")
+        if not ts_value:
+            ts_value = iso_from_timestamp(locator_path.stat().st_mtime, config.timezone)
+        text = content.replace("\r\n", "\n").replace("\r", "\n")
+        payload = {"speaker": message.get("speaker"), "content": content}
+        if message.get("thread_id") is not None:
+            payload["thread_id"] = message.get("thread_id")
+        draft = {
+            "schema_version": "0.2",
+            "ts": ts_value,
+            "type": "chat.message",
+            "source": {"kind": "chat_json_file", "locator": locator_value, "meta": {}},
+            "refs": [{"kind": "file", "uri": f"file:{locator_value}", "span": {"idx": idx}}],
+            "tags": tags,
+            "text": text,
+            "payload": payload,
+        }
+        drafts.append(draft)
+    return drafts
+
+
 def _build_source_drafts(source: dict[str, Any], extra_tags: list[str], config: OpsConfig) -> list[dict[str, Any]]:
     cfg = dict(source.get("config", {}))
     if "copy" not in cfg:
@@ -625,6 +682,27 @@ def _merge_tags(base: list[str], extra: list[str]) -> list[str]:
         if item not in merged:
             merged.append(item)
     return merged
+
+
+def _parse_config_args(values: list[str] | None) -> dict[str, Any]:
+    if not values:
+        return {}
+    if len(values) == 1 and values[0].lstrip().startswith("{"):
+        return json.loads(values[0])
+    config: dict[str, Any] = {}
+    for item in values:
+        if "=" not in item:
+            raise OpsError(f"Invalid config entry: {item}")
+        key, raw_value = item.split("=", 1)
+        value = raw_value.strip()
+        if value.lower() in {"true", "false"}:
+            parsed: Any = value.lower() == "true"
+        elif value.isdigit():
+            parsed = int(value)
+        else:
+            parsed = value
+        config[key.strip()] = parsed
+    return config
 
 
 def _copy_source(path: Path, dest_dir: Path) -> Path:
@@ -776,6 +854,12 @@ def build_parser() -> argparse.ArgumentParser:
     ingest_run.add_argument("name")
     ingest_run.add_argument("--tag", dest="tags", action="append")
     ingest_run.add_argument("--dry-run", action="store_true")
+    ingest_chat = ingest_sub.add_parser("chat_json", parents=[common])
+    ingest_chat.add_argument("path")
+    ingest_chat.add_argument("--tag", dest="tags", action="append")
+    ingest_chat.add_argument("--copy", dest="copy", action="store_true")
+    ingest_chat.add_argument("--no-copy", dest="copy", action="store_false")
+    ingest_chat.set_defaults(copy=True)
 
     view_parser = subparsers.add_parser("view")
     view_sub = view_parser.add_subparsers(dest="action")
@@ -798,7 +882,7 @@ def build_parser() -> argparse.ArgumentParser:
     job_add = job_sub.add_parser("add", parents=[common])
     job_add.add_argument("name")
     job_add.add_argument("--kind", required=True)
-    job_add.add_argument("--config")
+    job_add.add_argument("--config", action="append")
     job_add.add_argument("--disabled", action="store_true")
     job_list = job_sub.add_parser("list", parents=[common])
     job_show = job_sub.add_parser("show", parents=[common])
@@ -863,6 +947,8 @@ def run(argv: list[str] | None = None) -> int:
     if args.command == "ingest":
         if args.action == "run":
             return cmd_ingest_run(args)
+        if args.action == "chat_json":
+            return cmd_ingest_chat_json(args)
     if args.command == "view":
         if args.action == "add":
             return cmd_view_add(args)

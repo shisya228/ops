@@ -1058,6 +1058,8 @@ def _execute_job(server: OpsdServer, job: dict[str, Any]) -> dict[str, Any]:
         if not tag or not out_dir:
             raise ValueError("artifact_pack config requires tag and out_dir")
         return _run_artifact_pack(server, tag=tag, out_dir=out_dir)
+    if kind == "index_rebuild":
+        return _run_index_rebuild(server, job)
     raise ValueError(f"Unsupported job kind: {kind}")
 
 
@@ -1215,6 +1217,87 @@ def _emit_artifact_event(server: OpsdServer, refs: list[dict[str, Any]], tags: l
     with conn:
         _insert_event(conn, event, event.get("dedupe_key"), created_at)
     conn.close()
+
+
+def _run_index_rebuild(server: OpsdServer, job: dict[str, Any]) -> dict[str, Any]:
+    config = job.get("config", {})
+    wipe = bool(config.get("wipe", False))
+    fts_enabled = bool(config.get("fts", True))
+    from_path = config.get("from")
+    report: dict[str, Any] = {"errors": [], "parsed": 0, "inserted": 0, "skipped": 0}
+    canonical_path = server.paths["events"]
+    if isinstance(from_path, str) and from_path:
+        candidate = Path(from_path)
+        canonical_path = candidate if candidate.is_absolute() else (server.paths["workspace"] / candidate)
+
+    conn = connect(server.paths["db"])
+    with conn:
+        if wipe:
+            conn.execute("DELETE FROM refs")
+            conn.execute("DELETE FROM dedupe")
+            conn.execute("DELETE FROM events")
+            conn.execute("DELETE FROM events_fts")
+    conn.close()
+
+    conn = connect(server.paths["db"])
+    created_at = iso_now(server.config.timezone)
+    if not canonical_path.exists():
+        conn.close()
+        raise ValueError(f"Canonical file not found: {canonical_path}")
+
+    with canonical_path.open("r", encoding="utf-8") as handle:
+        for line_no, line in enumerate(handle, start=1):
+            raw = line.strip()
+            if not raw:
+                continue
+            try:
+                event = json.loads(raw)
+            except json.JSONDecodeError as exc:
+                report["errors"].append({"line": line_no, "error": str(exc)})
+                continue
+            report["parsed"] += 1
+            event_id = event.get("id")
+            if not event_id:
+                report["errors"].append({"line": line_no, "error": "Missing event id"})
+                continue
+            existing = conn.execute("SELECT 1 FROM events WHERE id = ?", (event_id,)).fetchone()
+            if existing:
+                report["skipped"] += 1
+                continue
+            dedupe_key = dedupe_key_from_event(event)
+            try:
+                with conn:
+                    _insert_event(conn, event, dedupe_key, created_at)
+            except Exception as exc:  # noqa: BLE001
+                report["errors"].append({"line": line_no, "error": str(exc)})
+                continue
+            report["inserted"] += 1
+    counts = conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+    ref_counts = conn.execute("SELECT COUNT(*) FROM refs").fetchone()[0]
+    dedupe_counts = conn.execute("SELECT COUNT(*) FROM dedupe").fetchone()[0]
+    conn.close()
+
+    timestamp = datetime.now(ZoneInfo(server.config.timezone)).strftime("%Y%m%dT%H%M%S")
+    report_dir = server.paths["workspace"] / "artifacts" / "runs" / "index_rebuild" / timestamp
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report_path = report_dir / "report.json"
+    report.update(
+        {
+            "from": str(canonical_path),
+            "wipe": wipe,
+            "fts": fts_enabled,
+            "counts": {"events": counts, "refs": ref_counts, "dedupe": dedupe_counts},
+            "failed": len(report["errors"]),
+        }
+    )
+    report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    _emit_artifact_event(
+        server,
+        refs=[{"kind": "file", "uri": f"file:{report_path}"}],
+        tags=["rebuild", "index"],
+        payload={"report": str(report_path), "job": job.get("name")},
+    )
+    return {"counts": report["counts"], "from": str(canonical_path), "wipe": wipe}
 
 
 def _ensure_builtin_views(conn, timezone: str) -> None:
