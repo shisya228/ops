@@ -13,10 +13,13 @@ from typing import Any
 
 from . import adapters
 from .canonical import append_event
+from .client import OpsdClient, OpsdClientError
 from .config import OpsConfig, load_config, write_default_config
 from .db import connect, init_db
-from .errors import AdapterError, ConfigError, DatabaseError, IOError, OpsError
-from .utils import generate_ulid, iso_from_timestamp, iso_now, normalize_text, sha256_hex
+from .errors import AdapterError, DatabaseError, OpsError
+from .events import dedupe_key_from_draft, dedupe_key_from_event, event_hash
+from .lock import FileLock
+from .utils import generate_ulid, iso_from_timestamp, iso_now, sha256_hex
 
 
 @dataclass
@@ -40,45 +43,12 @@ def _workspace_paths(config: OpsConfig) -> dict[str, Path]:
     }
 
 
-def _event_hash(event_data: dict[str, Any]) -> dict[str, str]:
-    payload = json.dumps(
-        event_data,
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return {"algo": "sha256", "value": sha256_hex(payload.encode("utf-8"))}
+def _opsd_host() -> str:
+    return "127.0.0.1"
 
 
-def _dedupe_key(adapter: str, locator: str, idx: int, content: str) -> str:
-    span_key = f"idx:{idx}"
-    norm_text = normalize_text(content)
-    material = f"{adapter}|{locator}|{span_key}|{norm_text}"
-    return sha256_hex(material.encode("utf-8"))
-
-
-def _dedupe_key_from_event(event: dict[str, Any]) -> str | None:
-    dedupe_key = event.get("dedupe_key")
-    if dedupe_key:
-        return dedupe_key
-    if event.get("type") != "chat.message":
-        return None
-    source = event.get("source", {})
-    adapter_name = source.get("kind")
-    locator = source.get("locator")
-    if not adapter_name or not locator:
-        return None
-    idx = None
-    refs = event.get("refs", [])
-    if refs:
-        idx = refs[0].get("span", {}).get("idx")
-    if idx is None:
-        return None
-    payload = event.get("payload", {})
-    content = payload.get("content") or event.get("text")
-    if not content:
-        return None
-    return _dedupe_key(adapter_name, locator, idx, content)
+def _opsd_port() -> int:
+    return int(os.environ.get("OPSD_PORT", "8840"))
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -165,39 +135,23 @@ def _insert_event(
         raise DatabaseError(f"SQLite insert error: {exc}") from exc
 
 
-def cmd_ingest(args: argparse.Namespace) -> int:
-    config = load_config(Path("ops.yml"))
-    paths = _workspace_paths(config)
-    source_path = Path(args.path)
-    if args.copy:
-        locator_path = _copy_source(source_path, paths["raw"])
-    else:
-        locator_path = source_path
-    locator = str(locator_path)
+def _build_chat_drafts(
+    locator_path: Path,
+    locator: str,
+    tags: list[str],
+    timezone: str,
+) -> tuple[list[dict[str, Any]], IngestResult]:
     result = IngestResult(errors=[])
-    adapter_name = "chat_json"
-    try:
-        conn = connect(paths["db"])
-    except DatabaseError:
-        raise
-    created_at = iso_now(config.timezone)
+    drafts: list[dict[str, Any]] = []
     for idx, message in enumerate(adapters.iter_chat_messages(locator_path)):
         content = message.get("content")
         if content is None:
             result.failed += 1
             result.errors.append(f"Missing content at idx {idx}")
             continue
-        dedupe_key = _dedupe_key(adapter_name, locator, idx, content)
-        row = conn.execute(
-            "SELECT event_id FROM dedupe WHERE dedupe_key = ?",
-            (dedupe_key,),
-        ).fetchone()
-        if row:
-            result.skipped += 1
-            continue
         ts_value = message.get("ts")
         if not ts_value:
-            ts_value = iso_from_timestamp(locator_path.stat().st_mtime, config.timezone)
+            ts_value = iso_from_timestamp(locator_path.stat().st_mtime, timezone)
         text = content.replace("\r\n", "\n").replace("\r", "\n")
         payload = {
             "speaker": message.get("speaker"),
@@ -205,12 +159,12 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         }
         if message.get("thread_id") is not None:
             payload["thread_id"] = message.get("thread_id")
-        event_core = {
+        draft = {
             "schema_version": "0.1",
             "ts": ts_value,
             "type": "chat.message",
             "source": {
-                "kind": adapter_name,
+                "kind": "chat_json",
                 "locator": locator,
                 "meta": {},
             },
@@ -221,30 +175,50 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                     "span": {"idx": idx},
                 }
             ],
-            "tags": args.tags or [],
+            "tags": tags,
             "text": text,
             "payload": payload,
         }
-        event_hash = _event_hash(event_core)
-        event = {
-            **event_core,
-            "id": generate_ulid(),
-            "hash": event_hash,
-            "dedupe_key": dedupe_key,
-        }
-        append_event(paths["events"], event)
+        drafts.append(draft)
+    return drafts, result
+
+
+def _apply_batch_response(result: IngestResult, response: dict[str, Any]) -> None:
+    result.new += int(response.get("inserted", 0))
+    result.skipped += int(response.get("skipped", 0))
+    result.failed += int(response.get("failed", 0))
+    for item in response.get("results", []):
+        if item.get("status") == "failed" and item.get("error"):
+            result.errors.append(item["error"])
+
+
+def cmd_ingest(args: argparse.Namespace) -> int:
+    config = load_config(Path("ops.yml"))
+    paths = _workspace_paths(config)
+    source_path = Path(args.path)
+    if args.copy:
+        locator_path = _copy_source(source_path, paths["raw"])
+    else:
+        locator_path = source_path
+    locator = str(locator_path)
+    drafts, result = _build_chat_drafts(locator_path, locator, args.tags or [], config.timezone)
+
+    use_daemon = os.environ.get("OPS_USE_DAEMON", "1") != "0"
+    if use_daemon and drafts:
+        client = OpsdClient(_opsd_host(), _opsd_port(), timeout=0.5)
         try:
-            with conn:
-                _insert_event(conn, event, dedupe_key, created_at)
-        except DatabaseError:
-            result.failed += 1
-            result.errors.append(f"SQLite insert failed at idx {idx}")
-            continue
-        result.new += 1
-    conn.close()
+            response = client.post_batch({"events": drafts, "atomic": False})
+        except OpsdClientError:
+            response = None
+        if response:
+            _apply_batch_response(result, response)
+        else:
+            _local_ingest_with_lock(paths, drafts, result, config.timezone)
+    elif drafts:
+        _local_ingest_with_lock(paths, drafts, result, config.timezone)
     if args.json:
         payload = {
-            "adapter": adapter_name,
+            "adapter": "chat_json",
             "source_path": locator,
             "new": result.new,
             "skipped": result.skipped,
@@ -260,6 +234,58 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         print("Adapter: chat_json")
         print(f"Tags: {args.tags or []}")
     return 0
+
+
+def _local_ingest_with_lock(
+    paths: dict[str, Path],
+    drafts: list[dict[str, Any]],
+    result: IngestResult,
+    timezone: str,
+) -> None:
+    lock_path = paths["canonical"] / ".ops.lock"
+    timeout = float(os.environ.get("OPS_LOCK_TIMEOUT", "10"))
+    with FileLock(lock_path, timeout=timeout):
+        conn = connect(paths["db"])
+        created_at = iso_now(timezone)
+        for draft in drafts:
+            dedupe = dedupe_key_from_draft(draft)
+            if not dedupe:
+                result.failed += 1
+                result.errors.append("Unable to compute dedupe_key")
+                continue
+            row = conn.execute(
+                "SELECT event_id FROM dedupe WHERE dedupe_key = ?",
+                (dedupe,),
+            ).fetchone()
+            if row:
+                result.skipped += 1
+                continue
+            event_core = {
+                "schema_version": draft["schema_version"],
+                "ts": draft["ts"],
+                "type": draft["type"],
+                "source": draft["source"],
+                "refs": draft["refs"],
+                "tags": draft.get("tags", []),
+                "text": draft["text"],
+                "payload": draft["payload"],
+            }
+            event = {
+                **event_core,
+                "id": generate_ulid(),
+                "hash": event_hash(event_core),
+                "dedupe_key": dedupe,
+            }
+            append_event(paths["events"], event)
+            try:
+                with conn:
+                    _insert_event(conn, event, dedupe, created_at)
+            except DatabaseError:
+                result.failed += 1
+                result.errors.append("SQLite insert failed")
+                continue
+            result.new += 1
+        conn.close()
 
 
 def cmd_query(args: argparse.Namespace) -> int:
@@ -436,7 +462,7 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
                     _insert_event(
                         conn,
                         event,
-                        _dedupe_key_from_event(event),
+                        dedupe_key_from_event(event),
                         created_at,
                     )
                 inserted += 1
@@ -447,6 +473,24 @@ def cmd_rebuild(args: argparse.Namespace) -> int:
     print("Rebuilt index.")
     print(f"Events processed: {processed}")
     print(f"Inserted: {inserted}  Skipped(existing): {skipped}  Parse errors: {parse_errors}")
+    return 0
+
+
+def cmd_daemon_start(args: argparse.Namespace) -> int:
+    from .daemon import run_opsd
+
+    run_opsd(host=args.host, port=args.port)
+    return 0
+
+
+def cmd_daemon_status(args: argparse.Namespace) -> int:
+    client = OpsdClient(args.host, args.port, timeout=0.5)
+    try:
+        payload = client.health()
+    except OpsdClientError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 50
+    print(json.dumps(payload, ensure_ascii=False))
     return 0
 
 
@@ -488,6 +532,15 @@ def build_parser() -> argparse.ArgumentParser:
     rebuild_cmd.add_argument("--no-wipe", dest="wipe", action="store_false")
     rebuild_cmd.set_defaults(wipe=True)
 
+    daemon_parser = subparsers.add_parser("daemon")
+    daemon_sub = daemon_parser.add_subparsers(dest="action")
+    start_cmd = daemon_sub.add_parser("start")
+    start_cmd.add_argument("--host", default=_opsd_host())
+    start_cmd.add_argument("--port", type=int, default=_opsd_port())
+    status_cmd = daemon_sub.add_parser("status")
+    status_cmd.add_argument("--host", default=_opsd_host())
+    status_cmd.add_argument("--port", type=int, default=_opsd_port())
+
     return parser
 
 
@@ -511,6 +564,13 @@ def run(argv: list[str] | None = None) -> int:
     if args.command == "index":
         if args.action == "rebuild":
             return cmd_rebuild(args)
+        parser.print_help(sys.stderr)
+        return 2
+    if args.command == "daemon":
+        if args.action == "start":
+            return cmd_daemon_start(args)
+        if args.action == "status":
+            return cmd_daemon_status(args)
         parser.print_help(sys.stderr)
         return 2
     raise AdapterError("Unknown command")
