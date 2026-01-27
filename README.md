@@ -7,6 +7,7 @@
 ```bash
 python -m ops init
 python -m ops ingest chat_json path/to/chat.json --tag demo --json
+python -m ops daemon start
 python -m ops query "demo" --json
 python -m ops show <event_id> --json
 python -m ops index rebuild --wipe
@@ -32,6 +33,7 @@ index/brain.sqlite OK
 
 - `ops init`：初始化工作目录结构、空 canonical 文件与 SQLite 索引。
 - `ops ingest chat_json <path>`：导入 JSON 数组或 JSONL 消息文件，支持去重与可重建索引。
+- `ops daemon start`：启动本地 `opsd` 单写者守护进程（默认 127.0.0.1:8840）。
 - `ops query <q>`：使用 FTS5 查询文本。
 - `ops show <event_id>`：查看完整事件结构。
 - `ops index rebuild`：从 `events.jsonl` 重建 SQLite 索引。
@@ -40,3 +42,5 @@ index/brain.sqlite OK
 
 - Canonical 事件写入 `data/canonical/events.jsonl`，永不修改历史行。
 - SQLite 索引位于 `data/index/brain.sqlite`，可随时删除并通过 rebuild 重建。
+- `ops ingest` 默认优先发送到本地 `opsd`（不可用时回退为本地写入），本地写入会持有全局锁防止并发损坏。
+- 多进程并发写入必须通过 `opsd` 或锁，禁止无锁并发写 canonical JSONL。
