@@ -5,6 +5,8 @@ from pathlib import Path
 
 from .errors import DatabaseError
 
+SCHEMA_VERSION = "0.2"
+
 DDL = """
 CREATE TABLE IF NOT EXISTS events (
 rowid INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -65,6 +67,49 @@ CREATE TRIGGER IF NOT EXISTS events_au AFTER UPDATE OF text ON events BEGIN
 INSERT INTO events_fts(events_fts, rowid, text) VALUES('delete', old.rowid, old.text);
 INSERT INTO events_fts(rowid, text) VALUES (new.rowid, new.text);
 END;
+
+CREATE TABLE IF NOT EXISTS meta (
+key TEXT PRIMARY KEY,
+value TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS sources (
+name TEXT PRIMARY KEY,
+kind TEXT NOT NULL,
+config_json TEXT NOT NULL DEFAULT '{}',
+tags_json TEXT NOT NULL DEFAULT '[]',
+created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sources_kind ON sources(kind);
+
+CREATE TABLE IF NOT EXISTS views (
+name TEXT PRIMARY KEY,
+description TEXT NOT NULL DEFAULT '',
+query_json TEXT NOT NULL,
+created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_views_name ON views(name);
+
+CREATE TABLE IF NOT EXISTS jobs (
+name TEXT PRIMARY KEY,
+kind TEXT NOT NULL,
+config_json TEXT NOT NULL DEFAULT '{}',
+enabled INTEGER NOT NULL DEFAULT 1,
+created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_enabled ON jobs(enabled);
+
+CREATE TABLE IF NOT EXISTS job_runs (
+id TEXT PRIMARY KEY,
+job_name TEXT NOT NULL,
+started_at TEXT NOT NULL,
+finished_at TEXT,
+status TEXT NOT NULL,
+output_json TEXT NOT NULL DEFAULT '{}',
+error TEXT,
+FOREIGN KEY(job_name) REFERENCES jobs(name) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_job_runs_job_started ON job_runs(job_name, started_at);
 """
 
 
@@ -93,6 +138,15 @@ def init_db(db_path: Path) -> None:
         conn = connect(db_path)
         with conn:
             conn.executescript(DDL)
+            existing = conn.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                ("schema_version",),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    "INSERT INTO meta (key, value) VALUES (?, ?)",
+                    ("schema_version", SCHEMA_VERSION),
+                )
     except sqlite3.Error as exc:
         raise DatabaseError(f"SQLite init error: {exc}") from exc
     finally:
