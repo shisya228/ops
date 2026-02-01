@@ -1,4 +1,4 @@
-# ops (Spec v0.1)
+# ops (Spec v0.2)
 
 `ops` 是一个本地事件索引工具，使用 JSONL 作为 canonical source-of-truth，并使用 SQLite + FTS5 作为可重建索引。
 
@@ -6,11 +6,13 @@
 
 ```bash
 python -m ops init
-python -m ops ingest chat_json path/to/chat.json --tag demo --json
-python -m ops daemon start
-python -m ops query "demo" --json
-python -m ops show <event_id> --json
-python -m ops index rebuild --wipe
+python -m ops serve
+python -m ops source add chat_export --path path/to/chat.json --tag demo --json
+python -m ops ingest run chat_export --json
+python -m ops search "demo" --json
+python -m ops event show <event_id> --json
+python -m ops job add index_rebuild --kind index_rebuild --config wipe=true --json
+python -m ops job run index_rebuild --json
 ```
 
 示例输出：
@@ -22,7 +24,7 @@ index/brain.sqlite OK
 ```
 
 ```json
-{"adapter":"chat_json","source_path":"data/raw/chat_json/abcd1234_chat.json","new":3,"skipped":0,"failed":0,"errors":[]}
+{"new":3,"skipped":0,"failed":0,"errors":[]}
 ```
 
 ```json
@@ -32,15 +34,17 @@ index/brain.sqlite OK
 ## 功能
 
 - `ops init`：初始化工作目录结构、空 canonical 文件与 SQLite 索引。
-- `ops ingest chat_json <path>`：导入 JSON 数组或 JSONL 消息文件，支持去重与可重建索引。
-- `ops daemon start`：启动本地 `opsd` 单写者守护进程（默认 127.0.0.1:8840）。
-- `ops query <q>`：使用 FTS5 查询文本。
-- `ops show <event_id>`：查看完整事件结构。
-- `ops index rebuild`：从 `events.jsonl` 重建 SQLite 索引。
+- `ops serve`：启动本地 `opsd` 服务（默认 127.0.0.1:7777）。
+- `ops source add|list|show|rm|test`：管理数据源（v0.2）。
+- `ops ingest run <source_name>`：通过 opsd 运行 ingest。
+- `ops ingest chat_json <path> --offline`：本地离线导入 JSON/JSONL 消息文件。
+- `ops search <q>`：使用 FTS5 查询文本。
+- `ops event show <event_id>`：查看完整事件结构。
+- `ops job add|run`：运行任务（包含 `index_rebuild` 重建索引）。
 
 ## 说明
 
 - Canonical 事件写入 `data/canonical/events.jsonl`，永不修改历史行。
 - SQLite 索引位于 `data/index/brain.sqlite`，可随时删除并通过 rebuild 重建。
-- `ops ingest` 默认优先发送到本地 `opsd`（不可用时回退为本地写入），本地写入会持有全局锁防止并发损坏。
+- CLI 默认通过 `opsd` 进行读写（`--endpoint` 可自定义）。离线 ingest 需显式 `--offline`。
 - 多进程并发写入必须通过 `opsd` 或锁，禁止无锁并发写 canonical JSONL。
